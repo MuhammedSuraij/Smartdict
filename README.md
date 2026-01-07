@@ -37,3 +37,6 @@ cl /I "C:\Program Files\Python312\include" smart_dict.c ^
 
 *Day-3:
     Add the versioning in insertion and deletion of the dictionary
+
+*Day-4:
+    made proper CPython-compliant custom mapping type with versioned values, dict-like behavior, and correct memory management.
