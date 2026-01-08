@@ -40,3 +40,6 @@ cl /I "C:\Program Files\Python312\include" smart_dict.c ^
 
 *Day-4:
     made proper CPython-compliant custom mapping type with versioned values, dict-like behavior, and correct memory management.
+
+*Day-5:
+    Add len(),values(),items(),keys() and iterations over the SmartDict.
