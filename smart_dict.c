@@ -6,11 +6,11 @@
 
 typedef struct {
     PyObject_HEAD
-    PyObject *dict;   // key -> list of versions
+    PyObject *dict;   /* key -> list of versions */
 } SmartDictObject;
 
 /* =========================
-   tp_new (allocation only)
+   tp_new
    ========================= */
 
 static PyObject *
@@ -18,7 +18,6 @@ SmartDict_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
 {
     SmartDictObject *self =
         (SmartDictObject *)type->tp_alloc(type, 0);
-
     if (!self)
         return NULL;
 
@@ -27,12 +26,11 @@ SmartDict_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         Py_DECREF(self);
         return NULL;
     }
-
     return (PyObject *)self;
 }
 
 /* =========================
-   tp_init (argument handling)
+   tp_init
    ========================= */
 
 static int
@@ -48,12 +46,17 @@ SmartDict_init(SmartDictObject *self, PyObject *args, PyObject *kwds)
         Py_ssize_t pos = 0;
 
         while (PyDict_Next(init_dict, &pos, &key, &value)) {
-            PyObject *list = PyList_New(0);
+            PyObject *list = PyList_New(1);
             if (!list)
                 return -1;
 
-            PyList_Append(list, value);
-            PyDict_SetItem(self->dict, key, list);
+            Py_INCREF(value);
+            PyList_SET_ITEM(list, 0, value);
+
+            if (PyDict_SetItem(self->dict, key, list) < 0) {
+                Py_DECREF(list);
+                return -1;
+            }
             Py_DECREF(list);
         }
     }
@@ -72,8 +75,7 @@ SmartDict_dealloc(SmartDictObject *self)
 }
 
 /* =========================
-   d[key] = value
-   del d[key]
+   d[key] = value / del d[key]
    ========================= */
 
 static int
@@ -82,14 +84,14 @@ SmartDict_setitem(PyObject *self, PyObject *key, PyObject *value)
     SmartDictObject *sd = (SmartDictObject *)self;
     PyObject *list;
 
-    /* del d[key] */
-    if (value == NULL) {
+    if (value == NULL)
         return PyDict_DelItem(sd->dict, key);
-    }
 
-    list = PyDict_GetItem(sd->dict, key);
-
+    list = PyDict_GetItemWithError(sd->dict, key);
     if (!list) {
+        if (PyErr_Occurred())
+            return -1;
+
         list = PyList_New(0);
         if (!list)
             return -1;
@@ -99,13 +101,14 @@ SmartDict_setitem(PyObject *self, PyObject *key, PyObject *value)
             return -1;
         }
         Py_DECREF(list);
+        list = PyDict_GetItem(sd->dict, key);
     }
 
     return PyList_Append(list, value);
 }
 
 /* =========================
-   d[key]  -> latest version
+   d[key]  (latest)
    ========================= */
 
 static PyObject *
@@ -115,13 +118,13 @@ SmartDict_getitem(PyObject *self, PyObject *key)
     PyObject *list = PyDict_GetItem(sd->dict, key);
 
     if (!list) {
-        PyErr_SetString(PyExc_KeyError, "Key not found");
+        PyErr_SetObject(PyExc_KeyError, key);
         return NULL;
     }
 
     Py_ssize_t size = PyList_Size(list);
-    if (size == 0) {
-        PyErr_SetString(PyExc_KeyError, "No values stored");
+    if (size <= 0) {
+        PyErr_SetObject(PyExc_KeyError, key);
         return NULL;
     }
 
@@ -140,14 +143,13 @@ SmartDict_get(PyObject *self, PyObject *args)
     PyObject *key;
     int version;
     SmartDictObject *sd = (SmartDictObject *)self;
-    PyObject *list;
 
     if (!PyArg_ParseTuple(args, "Oi", &key, &version))
         return NULL;
 
-    list = PyDict_GetItem(sd->dict, key);
+    PyObject *list = PyDict_GetItem(sd->dict, key);
     if (!list) {
-        PyErr_SetString(PyExc_KeyError, "Key not found");
+        PyErr_SetObject(PyExc_KeyError, key);
         return NULL;
     }
 
@@ -171,14 +173,13 @@ SmartDict_delete(PyObject *self, PyObject *args)
     PyObject *key;
     int version = -1;
     SmartDictObject *sd = (SmartDictObject *)self;
-    PyObject *list;
 
     if (!PyArg_ParseTuple(args, "O|i", &key, &version))
         return NULL;
 
-    list = PyDict_GetItem(sd->dict, key);
+    PyObject *list = PyDict_GetItem(sd->dict, key);
     if (!list) {
-        PyErr_SetString(PyExc_KeyError, "Key not found");
+        PyErr_SetObject(PyExc_KeyError, key);
         return NULL;
     }
 
@@ -192,7 +193,8 @@ SmartDict_delete(PyObject *self, PyObject *args)
         return NULL;
     }
 
-    PySequence_DelItem(list, version - 1);
+    if (PySequence_DelItem(list, version - 1) < 0)
+        return NULL;
 
     if (PyList_Size(list) == 0)
         PyDict_DelItem(sd->dict, key);
@@ -201,119 +203,178 @@ SmartDict_delete(PyObject *self, PyObject *args)
 }
 
 /* =========================
-   Length function
+   undo(key [, steps])
    ========================= */
 
-   static Py_ssize_t SmartDict_length(PyObject *self)
+static PyObject *
+SmartDict_undo(PyObject *self, PyObject *args)
 {
-    SmartDictObject *sd=(SmartDictObject *)self;
-    return PyDict_Size(sd->dict);
+    PyObject *key;
+    int steps = 1;
+    SmartDictObject *sd = (SmartDictObject *)self;
+
+    if (!PyArg_ParseTuple(args, "O|i", &key, &steps))
+        return NULL;
+
+    PyObject *list = PyDict_GetItem(sd->dict, key);
+    if (!list) {
+        PyErr_SetObject(PyExc_KeyError, key);
+        return NULL;
+    }
+
+    Py_ssize_t size = PyList_Size(list);
+    if (steps <= 0 || steps > size) {
+        PyErr_SetString(PyExc_IndexError, "Invalid undo steps");
+        return NULL;
+    }
+
+    while (steps--) {
+        if (PySequence_DelItem(list, PyList_Size(list) - 1) < 0)
+            return NULL;
+    }
+
+    if (PyList_Size(list) == 0)
+        PyDict_DelItem(sd->dict, key);
+
+    Py_RETURN_NONE;
 }
 
-
 /* =========================
-   Iteration function
+   snapshot()
    ========================= */
 
-static PyObject *SmartDict_iter(PyObject *self)
+static PyObject *
+SmartDict_snapshot(SmartDictObject *self, PyObject *Py_UNUSED(ignored))
 {
-    SmartDictObject *sd=(SmartDictObject *)self;
-    return PyObject_GetIter(sd->dict);
-}
+    PyObject *snapshot = PyDict_New();
+    if (!snapshot)
+        return NULL;
 
+    PyObject *key, *list;
+    Py_ssize_t pos = 0;
 
-/* =========================
-   Keys function
-   ========================= */
-
-static PyObject *SmartDict_keys(PyObject *self,PyObject *Py_UNUSED(ignored))
-{
-    SmartDictObject *sd=(SmartDictObject *)self;
-    return PyDict_Keys(sd->dict);
-}
-
-
-/* =========================
-   Values function
-   ========================= */
-
-static PyObject *SmartDict_values(PyObject *self,PyObject *Py_UNUSED(ignored))
-{
-    SmartDictObject *sd=(SmartDictObject *)self;
-    PyObject *result= PyList_New(0);
-
-    PyObject *key,*list;
-    Py_ssize_t pos=0;
-
-    while (PyDict_Next(sd->dict,&pos,&key,&list))
-    {
-        Py_ssize_t size=PyList_Size(list);
-        if(size>0)
-        {
-            PyObject *value=PyList_GetItem(list,size-1);
-            Py_INCREF(value);
-            PyList_Append(result,value);
+    while (PyDict_Next(self->dict, &pos, &key, &list)) {
+        Py_ssize_t size = PyList_Size(list);
+        if (size > 0) {
+            PyObject *value = PyList_GetItem(list, size - 1); // borrowed
+            Py_INCREF(value);                                 // snapshot owns it
+            if (PyDict_SetItem(snapshot, key, value) < 0) {
+                Py_DECREF(value);
+                Py_DECREF(snapshot);
+                return NULL;
+            }
             Py_DECREF(value);
         }
     }
 
-    return result;
-    
+    return snapshot;
 }
 
 
-static PyObject *SmartDict_items(PyObject *self,PyObject *Py_UNUSED(ignored))
-{
-    SmartDictObject *sd=(SmartDictObject *)self;
-    PyObject *result=PyList_New(0);
+/* =========================
+   keys / values / items
+   ========================= */
 
-    PyObject *key,*list;
-    Py_ssize_t pos=0;
-    while (PyDict_Next(sd->dict,&pos,&key,&list))
-    {
-        Py_ssize_t size=PyList_Size(list);
-        if(size>0)
-        {
-            PyObject *value=PyList_GetItem(list,size-1);
-            Py_INCREF(key);
-            Py_INCREF(value);
-            PyObject *pair=PyTuple_Pack(2,key,value);
-            PyList_Append(result,pair);
+static PyObject *
+SmartDict_keys(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    return PyDict_Keys(((SmartDictObject *)self)->dict);
+}
+
+static PyObject *
+SmartDict_values(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    SmartDictObject *sd = (SmartDictObject *)self;
+    PyObject *res = PyList_New(0);
+    if (!res)
+        return NULL;
+
+    PyObject *key, *list;
+    Py_ssize_t pos = 0;
+
+    while (PyDict_Next(sd->dict, &pos, &key, &list)) {
+        Py_ssize_t size = PyList_Size(list);
+        if (size > 0)
+            PyList_Append(res, PyList_GetItem(list, size - 1));
+    }
+    return res;
+}
+
+static PyObject *
+SmartDict_items(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    SmartDictObject *sd = (SmartDictObject *)self;
+    PyObject *res = PyList_New(0);
+    if (!res)
+        return NULL;
+
+    PyObject *key, *list;
+    Py_ssize_t pos = 0;
+
+    while (PyDict_Next(sd->dict, &pos, &key, &list)) {
+        Py_ssize_t size = PyList_Size(list);
+        if (size > 0) {
+            PyObject *pair = PyTuple_Pack(2, key, PyList_GetItem(list, size - 1));
+            PyList_Append(res, pair);
             Py_DECREF(pair);
-            Py_DECREF(key);
-            Py_DECREF(value);
         }
     }
-    return result;
+    return res;
 }
 
+/* =========================
+   repr
+   ========================= */
 
-static PyObject *SmartDict_repr(PyObject *self)
+static PyObject *
+SmartDict_repr(PyObject *self)
 {
-    SmartDictObject *sd=(SmartDictObject *)self;
-    PyObject *temp=PyDict_New();
+    SmartDictObject *sd = (SmartDictObject *)self;
+    PyObject *tmp = PyDict_New();
+    if (!tmp)
+        return NULL;
 
-    PyObject *key,*list;
-    Py_ssize_t pos=0;
+    PyObject *key, *list;
+    Py_ssize_t pos = 0;
 
-    while (PyDict_Next(sd->dict,&pos,&key,&list))
-    {
-        Py_ssize_t size=PyList_Size(list);
-        if(size>0)
-        {
-            PyObject *value= PyList_GetItem(list,size-1);
-            Py_INCREF(value);
-            PyDict_SetItem(temp,key,value);
-            Py_DECREF(value);
+    while (PyDict_Next(sd->dict, &pos, &key, &list)) {
+        Py_ssize_t size = PyList_Size(list);
+        if (size > 0) {
+            PyObject *val = PyList_GetItem(list, size - 1);
+            Py_INCREF(val);
+            PyDict_SetItem(tmp, key, val);
+            Py_DECREF(val);
         }
     }
-    
-    PyObject *repr=PyObject_Repr(temp);
-    Py_DECREF(temp);
-    return repr;
 
+    PyObject *r = PyObject_Repr(tmp);
+    Py_DECREF(tmp);
+    return r;
 }
 
+/* =========================
+   len(d)
+   ========================= */
+
+static Py_ssize_t
+SmartDict_length(PyObject *self)
+{
+    return PyDict_Size(((SmartDictObject *)self)->dict);
+}
+
+/* =========================
+   iteration
+   ========================= */
+
+static PyObject *
+SmartDict_iter(PyObject *self)
+{
+    return PyObject_GetIter(((SmartDictObject *)self)->dict);
+}
+
+/* =========================
+   Mapping
+   ========================= */
 
 static PyMappingMethods SmartDict_as_mapping = {
     .mp_length = SmartDict_length,
@@ -322,20 +383,22 @@ static PyMappingMethods SmartDict_as_mapping = {
 };
 
 /* =========================
-   Methods
+   Methods table
    ========================= */
 
 static PyMethodDef SmartDict_methods[] = {
-    {"get", SmartDict_get, METH_VARARGS, "Get specific version"},
+    {"get", SmartDict_get, METH_VARARGS, "Get version"},
     {"delete", SmartDict_delete, METH_VARARGS, "Delete key or version"},
-    {"keys", SmartDict_keys, METH_NOARGS, "Return keys"},
-    {"values", SmartDict_values, METH_NOARGS, "Return latest value"},
-    {"items", SmartDict_items, METH_NOARGS,"Return items"},
+    {"undo", SmartDict_undo, METH_VARARGS, "Undo last versions"},
+    {"snapshot", (PyCFunction)SmartDict_snapshot, METH_NOARGS, "Create snapshot"},
+    {"keys", SmartDict_keys, METH_NOARGS, "Keys"},
+    {"values", SmartDict_values, METH_NOARGS, "Latest values"},
+    {"items", SmartDict_items, METH_NOARGS, "Latest items"},
     {NULL}
 };
 
 /* =========================
-   Type definition
+   Type
    ========================= */
 
 static PyTypeObject SmartDictType = {
@@ -349,8 +412,8 @@ static PyTypeObject SmartDictType = {
     .tp_methods = SmartDict_methods,
     .tp_new = SmartDict_new,
     .tp_init = (initproc)SmartDict_init,
-    .tp_iter=SmartDict_iter,
-    .tp_repr=SmartDict_repr,
+    .tp_iter = SmartDict_iter,
+    .tp_repr = SmartDict_repr,
 };
 
 /* =========================
@@ -367,18 +430,14 @@ static PyModuleDef smartdictmodule = {
 PyMODINIT_FUNC
 PyInit_smart_dict(void)
 {
-    PyObject *m;
-
     if (PyType_Ready(&SmartDictType) < 0)
         return NULL;
 
-    m = PyModule_Create(&smartdictmodule);
+    PyObject *m = PyModule_Create(&smartdictmodule);
     if (!m)
         return NULL;
 
     Py_INCREF(&SmartDictType);
-    PyModule_AddObject(m, "SmartDict",
-                       (PyObject *)&SmartDictType);
-
+    PyModule_AddObject(m, "SmartDict", (PyObject *)&SmartDictType);
     return m;
 }
